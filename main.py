@@ -182,7 +182,7 @@ async def get_charts_from_piped(region: str = "ID") -> dict:
         for instance in PIPED_INSTANCES:
             try:
                 resp = await client.get(f"{instance}/trending?region={region}")
-                if resp.status_code == 200:
+                if resp.status_code == 200 and resp.text.strip():
                     videos = resp.json()
                     if not isinstance(videos, list) or not videos:
                         continue
@@ -249,7 +249,7 @@ async def get_charts(region: str = "ID"):
 
             logger.warning("ytmusicapi charts kosong, fallback Piped")
         except Exception as e:
-            logger.warning(f"ytmusicapi charts gagal: {e}")
+            logger.warning(f"ytmusicapi charts gagal: {e}", exc_info=True)
 
     return await get_charts_from_piped(region)
 
