@@ -16,7 +16,7 @@ app = FastAPI(title="iMuzik API", version="1.0.0")
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://i-muzik.vercel.app",
+    "https://i-muzix.vercel.app",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -227,18 +227,26 @@ async def get_charts(region: str = "ID"):
             charts = ytmusic.get_charts(country=region)
             result = {"trending": [], "top_songs": [], "top_videos": [], "source": "ytmusicapi"}
 
+            def extract_items(data):
+                """Handle both struktur lama (dict dgn 'items') dan baru (langsung list)."""
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    return data.get("items", [])
+                return []
+
             if "songs" in charts:
-                for t in charts["songs"].get("items", [])[:20]:
+                for t in extract_items(charts["songs"])[:20]:
                     f = ytm_track_to_dict(t)
                     if f.get("id"): result["top_songs"].append(f)
 
             if "trending" in charts:
-                for t in charts["trending"].get("items", [])[:12]:
+                for t in extract_items(charts["trending"])[:12]:
                     f = ytm_track_to_dict(t)
                     if f.get("id"): result["trending"].append(f)
 
             if "videos" in charts:
-                for t in charts["videos"].get("items", [])[:10]:
+                for t in extract_items(charts["videos"])[:10]:
                     f = ytm_track_to_dict(t)
                     if f.get("id"): result["top_videos"].append(f)
 
