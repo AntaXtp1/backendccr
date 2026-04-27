@@ -16,7 +16,7 @@ app = FastAPI(title="iMuzik API", version="1.0.0")
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://i-muzix.vercel.app",
+    "https://i-muzik.vercel.app",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -218,46 +218,50 @@ async def health():
 @app.get("/charts")
 async def get_charts(region: str = "ID"):
     """
-    Primary: ytmusicapi (data kaya, region ID)
+    Charts via search-based approach (ytmusicapi v1.11.5+).
+    v1.11.5 mengubah struktur get_charts() — sekarang return playlist bukan tracks.
+    Solusi: pakai search() sebagai proxy trending yang lebih reliable.
     Fallback: Piped /trending
     """
     if YTM_AVAILABLE:
         try:
-            # ✅ v1.x: 'country' bukan 'country_code'
-            charts = ytmusic.get_charts(country=region)
-            result = {"trending": [], "top_songs": [], "top_videos": [], "source": "ytmusicapi"}
+            # v1.11.5+: get_charts() return playlist objects, bukan individual tracks
+            # Workaround: pakai search sebagai proxy trending per region
+            region_queries = {
+                "ID": ["trending musik indonesia 2025", "lagu hits indonesia", "viral indonesia"],
+                "US": ["trending music 2025", "top hits usa", "billboard hot 100"],
+                "GB": ["trending music uk 2025", "top hits uk"],
+            }
+            queries = region_queries.get(region, [f"trending music {region} 2025", "top hits"])
 
-            def extract_items(data):
-                """Handle both struktur lama (dict dgn 'items') dan baru (langsung list)."""
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict):
-                    return data.get("items", [])
-                return []
+            result = {"trending": [], "top_songs": [], "top_videos": [], "source": "ytmusicapi_search"}
+            seen_ids = set()
 
-            if "songs" in charts:
-                for t in extract_items(charts["songs"])[:20]:
-                    f = ytm_track_to_dict(t)
-                    if f.get("id"): result["top_songs"].append(f)
-
-            if "trending" in charts:
-                for t in extract_items(charts["trending"])[:12]:
-                    f = ytm_track_to_dict(t)
-                    if f.get("id"): result["trending"].append(f)
-
-            if "videos" in charts:
-                for t in extract_items(charts["videos"])[:10]:
-                    f = ytm_track_to_dict(t)
-                    if f.get("id"): result["top_videos"].append(f)
+            for i, query in enumerate(queries):
+                try:
+                    search_results = ytmusic.search(query, filter="songs", limit=15)
+                    for t in search_results:
+                        f = ytm_track_to_dict(t)
+                        if f.get("id") and f["id"] not in seen_ids:
+                            seen_ids.add(f["id"])
+                            if i == 0:
+                                result["trending"].append(f)
+                            elif i == 1:
+                                result["top_songs"].append(f)
+                            else:
+                                result["top_videos"].append(f)
+                except Exception as qe:
+                    logger.warning(f"Search query gagal ({query}): {qe}")
+                    continue
 
             total = len(result["top_songs"]) + len(result["trending"]) + len(result["top_videos"])
             if total > 0:
-                logger.info(f"Charts OK ytmusicapi: {total} tracks")
+                logger.info(f"Charts OK via search: {total} tracks")
                 return result
 
-            logger.warning("ytmusicapi charts kosong, fallback Piped")
+            logger.warning("ytmusicapi search charts kosong, fallback Piped")
         except Exception as e:
-            logger.warning(f"ytmusicapi charts gagal: {e}", exc_info=True)
+            logger.warning(f"ytmusicapi charts gagal: {e}")
 
     return await get_charts_from_piped(region)
 
@@ -403,10 +407,10 @@ async def get_artist(channel_id: str):
 @app.get("/genres")
 async def get_genres():
     return {"genres": [
-        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2024"},
+        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2026"},
         {"id": "hiphop",     "name": "Hip-Hop",    "color": "#FF6B35", "query": "hip hop rap indonesia"},
         {"id": "rnb",        "name": "R&B / Soul", "color": "#9B59B6", "query": "rnb soul indonesia"},
-        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2024"},
+        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2026"},
         {"id": "rock",       "name": "Rock",       "color": "#E74C3C", "query": "rock indonesia"},
         {"id": "electronic", "name": "Electronic", "color": "#1ABC9C", "query": "electronic edm indonesia"},
         {"id": "jazz",       "name": "Jazz",       "color": "#F39C12", "query": "jazz indonesia lofi"},
@@ -414,5 +418,5 @@ async def get_genres():
         {"id": "kpop",       "name": "K-Pop",      "color": "#FF4081", "query": "kpop viral"},
         {"id": "acoustic",   "name": "Acoustic",   "color": "#795548", "query": "acoustic cover indonesia"},
         {"id": "classical",  "name": "Klasik",     "color": "#607D8B", "query": "musik klasik indonesia"},
-        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2024"},
+        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2026"},
     ]}
