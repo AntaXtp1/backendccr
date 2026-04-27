@@ -16,7 +16,7 @@ app = FastAPI(title="iMuzik API", version="1.0.0")
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://i-muzik.vercel.app",
+    "https://i-muzix.vercel.app/",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -30,14 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── PIPED INSTANCES ─────────────────────────────────────────────────────────
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://piped-api.garudalinux.org",
-    "https://api.piped.projectsegfau.lt",
-    "https://piped.video/api",
-    "https://watchapi.whatever.social",
-    "https://api.piped.yt",
+# ─── INVIDIOUS INSTANCES ─────────────────────────────────────────────────────
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
 ]
 
 # ─── YTMUSICAPI INIT ─────────────────────────────────────────────────────────
@@ -119,21 +116,34 @@ def ytm_track_to_dict(track: dict) -> dict:
         logger.error(f"Error formatting track: {e}")
         return {}
 
-def piped_video_to_dict(video: dict) -> dict:
+def invidious_video_to_dict(video: dict) -> dict:
+    """Convert Invidious trending video object ke format iMuzik."""
     try:
-        raw_url = video.get("url", "")
-        video_id = raw_url.split("=")[-1] if "=" in raw_url else ""
+        video_id = video.get("videoId", "")
+        # Ambil thumbnail resolusi tertinggi dari Invidious
+        thumbs = video.get("videoThumbnails", [])
+        thumbnail = ""
+        if thumbs:
+            # Invidious sort by quality: maxres, high, medium, default
+            priority = ["maxres", "high", "sddefault", "medium", "default"]
+            for prio in priority:
+                match = next((t for t in thumbs if t.get("quality") == prio), None)
+                if match:
+                    thumbnail = match.get("url", "")
+                    break
+            if not thumbnail:
+                thumbnail = thumbs[0].get("url", "")
         return {
             "id": video_id,
             "title": video.get("title", "Unknown"),
-            "artist": video.get("uploaderName", "Unknown Artist"),
+            "artist": video.get("author", "Unknown Artist"),
             "album": "",
-            "duration": format_duration(video.get("duration", 0)),
-            "thumbnail": video.get("thumbnail", ""),
+            "duration": format_duration(video.get("lengthSeconds", 0)),
+            "thumbnail": thumbnail,
             "videoId": video_id,
         }
     except Exception as e:
-        logger.error(f"Error formatting piped video: {e}")
+        logger.error(f"Error formatting invidious video: {e}")
         return {}
 
 # ─── STREAM RESOLVERS ────────────────────────────────────────────────────────
@@ -158,7 +168,7 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
         if proc.returncode == 0:
             url = stdout.decode().strip().split("\n")[0]
             if url.startswith("http"):
@@ -167,62 +177,75 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
         else:
             logger.warning(f"yt-dlp gagal: {stderr.decode()[:200]}")
     except asyncio.TimeoutError:
-        logger.error("yt-dlp timeout (25s)")
+        logger.error("yt-dlp timeout (8s) - skip ke fallback")
     except Exception as e:
         logger.error(f"yt-dlp error: {e}")
     return None
 
 
-async def resolve_via_piped(video_id: str, quality: str = "normal") -> Optional[str]:
-    """FALLBACK: Piped instances kalau yt-dlp gagal."""
+async def resolve_via_invidious(video_id: str, quality: str = "normal") -> Optional[str]:
+    """FALLBACK: Invidious instances kalau yt-dlp gagal."""
     async with httpx.AsyncClient(timeout=10) as client:
-        for instance in PIPED_INSTANCES:
+        for instance in INVIDIOUS_INSTANCES:
             try:
-                resp = await client.get(f"{instance}/streams/{video_id}")
-                if resp.status_code == 200:
+                resp = await client.get(f"{instance}/api/v1/videos/{video_id}")
+                if resp.status_code == 200 and resp.text.strip():
                     data = resp.json()
-                    audio_streams = data.get("audioStreams", [])
+                    # adaptiveFormats = audio-only streams
+                    adaptive = data.get("adaptiveFormats", [])
+                    audio_streams = [
+                        s for s in adaptive
+                        if "audio" in s.get("type", "") and "video" not in s.get("type", "")
+                    ]
                     if not audio_streams:
                         continue
 
-                    audio_streams.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-                    target = next(
-                        (s for s in audio_streams if s.get("bitrate", 0) <= 130000),
-                        audio_streams[-1]
-                    ) if quality == "normal" else audio_streams[0]
+                    audio_streams.sort(key=lambda x: int(x.get("bitrate", 0)), reverse=True)
+                    if quality == "normal":
+                        # Pilih bitrate ≤130kbps, fallback ke terendah
+                        target = next(
+                            (s for s in reversed(audio_streams) if int(s.get("bitrate", 0)) <= 130000),
+                            audio_streams[-1]
+                        )
+                    else:
+                        target = audio_streams[0]
 
                     stream_url = target.get("url")
                     if stream_url:
-                        logger.info(f"Piped OK ({instance}): {target.get('bitrate',0)//1000}kbps")
+                        kbps = int(target.get("bitrate", 0)) // 1000
+                        logger.info(f"Invidious OK ({instance}): {kbps}kbps")
                         return stream_url
             except Exception as e:
-                logger.warning(f"Piped {instance} failed: {e}")
+                logger.warning(f"Invidious {instance} failed: {e}")
                 continue
     return None
 
-# ─── CHARTS FALLBACK VIA PIPED ───────────────────────────────────────────────
+# ─── CHARTS FALLBACK VIA INVIDIOUS ──────────────────────────────────────────
 
-async def get_charts_from_piped(region: str = "ID") -> dict:
-    """Fallback kalau ytmusicapi down."""
+async def get_charts_from_invidious(region: str = "ID") -> dict:
+    """Fallback kalau ytmusicapi down - pakai Invidious trending."""
     async with httpx.AsyncClient(timeout=15) as client:
-        for instance in PIPED_INSTANCES:
+        for instance in INVIDIOUS_INSTANCES:
             try:
-                resp = await client.get(f"{instance}/trending?region={region}")
+                resp = await client.get(
+                    f"{instance}/api/v1/trending",
+                    params={"type": "music", "region": region}
+                )
                 if resp.status_code == 200 and resp.text.strip():
                     videos = resp.json()
                     if not isinstance(videos, list) or not videos:
                         continue
-                    tracks = [t for t in [piped_video_to_dict(v) for v in videos[:30]] if t.get("id")]
+                    tracks = [t for t in [invidious_video_to_dict(v) for v in videos[:30]] if t.get("id")]
                     if tracks:
-                        logger.info(f"Charts Piped OK ({instance}): {len(tracks)} tracks")
+                        logger.info(f"Charts Invidious OK ({instance}): {len(tracks)} tracks")
                         return {
                             "trending": tracks[:12],
                             "top_songs": tracks[12:24],
                             "top_videos": tracks[24:],
-                            "source": "piped_fallback",
+                            "source": "invidious_fallback",
                         }
             except Exception as e:
-                logger.warning(f"Piped charts {instance} gagal: {e}")
+                logger.warning(f"Invidious charts {instance} gagal: {e}")
                 continue
     raise HTTPException(503, "Semua sumber charts gagal")
 
@@ -247,7 +270,7 @@ async def get_charts(region: str = "ID"):
     Charts via search-based approach (ytmusicapi v1.11.5+).
     v1.11.5 mengubah struktur get_charts() — sekarang return playlist bukan tracks.
     Solusi: pakai search() sebagai proxy trending yang lebih reliable.
-    Fallback: Piped /trending
+    Fallback: Invidious /api/v1/trending
     """
     if YTM_AVAILABLE:
         try:
@@ -285,11 +308,11 @@ async def get_charts(region: str = "ID"):
                 logger.info(f"Charts OK via search: {total} tracks")
                 return result
 
-            logger.warning("ytmusicapi search charts kosong, fallback Piped")
+            logger.warning("ytmusicapi search charts kosong, fallback Invidious")
         except Exception as e:
             logger.warning(f"ytmusicapi charts gagal: {e}")
 
-    return await get_charts_from_piped(region)
+    return await get_charts_from_invidious(region)
 
 
 @app.get("/search")
@@ -335,9 +358,9 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str
 async def get_stream(video_id: str, quality: str = "normal"):
     """
     Stream resolver priority:
-    1. yt-dlp  ← PRIMARY (real VM, langsung YouTube)
-    2. Piped   ← FALLBACK
-    3. Embed   ← LAST RESORT
+    1. yt-dlp      ← PRIMARY
+    2. Invidious   ← FALLBACK
+    3. Embed       ← LAST RESORT
     """
     if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
         raise HTTPException(400, "Invalid video ID")
@@ -345,10 +368,10 @@ async def get_stream(video_id: str, quality: str = "normal"):
     # 1️⃣ yt-dlp
     stream_url = await resolve_via_ytdlp(video_id, quality)
 
-    # 2️⃣ Piped fallback
+    # 2️⃣ Invidious fallback
     if not stream_url:
-        logger.info(f"yt-dlp gagal, coba Piped untuk {video_id}")
-        stream_url = await resolve_via_piped(video_id, quality)
+        logger.info(f"yt-dlp gagal, coba Invidious untuk {video_id}")
+        stream_url = await resolve_via_invidious(video_id, quality)
 
     if stream_url:
         return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality}
@@ -433,10 +456,10 @@ async def get_artist(channel_id: str):
 @app.get("/genres")
 async def get_genres():
     return {"genres": [
-        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2024"},
+        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2026"},
         {"id": "hiphop",     "name": "Hip-Hop",    "color": "#FF6B35", "query": "hip hop rap indonesia"},
         {"id": "rnb",        "name": "R&B / Soul", "color": "#9B59B6", "query": "rnb soul indonesia"},
-        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2024"},
+        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2026"},
         {"id": "rock",       "name": "Rock",       "color": "#E74C3C", "query": "rock indonesia"},
         {"id": "electronic", "name": "Electronic", "color": "#1ABC9C", "query": "electronic edm indonesia"},
         {"id": "jazz",       "name": "Jazz",       "color": "#F39C12", "query": "jazz indonesia lofi"},
@@ -444,5 +467,5 @@ async def get_genres():
         {"id": "kpop",       "name": "K-Pop",      "color": "#FF4081", "query": "kpop viral"},
         {"id": "acoustic",   "name": "Acoustic",   "color": "#795548", "query": "acoustic cover indonesia"},
         {"id": "classical",  "name": "Klasik",     "color": "#607D8B", "query": "musik klasik indonesia"},
-        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2024"},
+        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2026"},
     ]}
