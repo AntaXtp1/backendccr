@@ -16,7 +16,7 @@ app = FastAPI(title="iMuzik API", version="1.0.0")
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://i-muzix.vercel.app",
+    "https://i-muzik.vercel.app",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -53,14 +53,37 @@ except Exception as e:
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def clean_thumbnail(thumbnails: list) -> str:
+    """
+    Ambil thumbnail resolusi tertinggi dan upgrade URL-nya kalau bisa.
+    Handle 2 format utama: lh3.googleusercontent.com dan i.ytimg.com
+    """
     if not thumbnails:
         return ""
+
     sorted_thumbs = sorted(
         thumbnails,
         key=lambda x: x.get("width", 0) * x.get("height", 0),
         reverse=True
     )
-    return sorted_thumbs[0].get("url", "").replace("=w226-h226", "=w500-h500")
+    url = sorted_thumbs[0].get("url", "")
+    if not url:
+        return ""
+
+    # Format 1: lh3.googleusercontent.com — replace semua =wN-hN-... ke ukuran besar
+    # Contoh: =w226-h226-l90-rj → =w500-h500-l90-rj
+    if "lh3.googleusercontent.com" in url:
+        url = re.sub(r"=w\d+-h\d+", "=w500-h500", url)
+        return url
+
+    # Format 2: i.ytimg.com — coba upgrade ke maxresdefault
+    if "i.ytimg.com" in url:
+        # hqdefault / mqdefault / sddefault → maxresdefault
+        url = re.sub(r"/(hqdefault|mqdefault|sddefault|default)(\.jpg)", "/maxresdefault\2", url)
+        return url
+
+    # Format lain: coba replace pattern umum kalau ada
+    url = re.sub(r"=w\d+-h\d+", "=w500-h500", url)
+    return url
 
 def format_duration(seconds) -> str:
     if not seconds:
@@ -128,11 +151,14 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "-f", fmt,
             "--no-playlist",
             "--no-warnings",
+            "--no-check-certificate",
+            "--extractor-args", "youtube:player_client=tv_embedded,web",
+            "--add-headers", "X-Youtube-Client-Name:85",
             f"https://www.youtube.com/watch?v={video_id}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode == 0:
             url = stdout.decode().strip().split("\n")[0]
             if url.startswith("http"):
@@ -228,11 +254,11 @@ async def get_charts(region: str = "ID"):
             # v1.11.5+: get_charts() return playlist objects, bukan individual tracks
             # Workaround: pakai search sebagai proxy trending per region
             region_queries = {
-                "ID": ["trending musik indonesia 2025", "lagu hits indonesia", "viral indonesia"],
-                "US": ["trending music 2025", "top hits usa", "billboard hot 100"],
-                "GB": ["trending music uk 2025", "top hits uk"],
+                "ID": ["trending musik indonesia 2026", "lagu viral indonesia 2026", "hits terbaru indonesia 2026"],
+                "US": ["trending music 2026", "top hits usa 2026", "billboard hot 100 2026"],
+                "GB": ["trending music uk 2026", "top hits uk 2026"],
             }
-            queries = region_queries.get(region, [f"trending music {region} 2025", "top hits"])
+            queries = region_queries.get(region, [f"trending music {region} 2026", "top hits 2026"])
 
             result = {"trending": [], "top_songs": [], "top_videos": [], "source": "ytmusicapi_search"}
             seen_ids = set()
@@ -407,10 +433,10 @@ async def get_artist(channel_id: str):
 @app.get("/genres")
 async def get_genres():
     return {"genres": [
-        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2026"},
+        {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2024"},
         {"id": "hiphop",     "name": "Hip-Hop",    "color": "#FF6B35", "query": "hip hop rap indonesia"},
         {"id": "rnb",        "name": "R&B / Soul", "color": "#9B59B6", "query": "rnb soul indonesia"},
-        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2026"},
+        {"id": "indie",      "name": "Indie",      "color": "#3498DB", "query": "indie indonesia 2024"},
         {"id": "rock",       "name": "Rock",       "color": "#E74C3C", "query": "rock indonesia"},
         {"id": "electronic", "name": "Electronic", "color": "#1ABC9C", "query": "electronic edm indonesia"},
         {"id": "jazz",       "name": "Jazz",       "color": "#F39C12", "query": "jazz indonesia lofi"},
@@ -418,5 +444,5 @@ async def get_genres():
         {"id": "kpop",       "name": "K-Pop",      "color": "#FF4081", "query": "kpop viral"},
         {"id": "acoustic",   "name": "Acoustic",   "color": "#795548", "query": "acoustic cover indonesia"},
         {"id": "classical",  "name": "Klasik",     "color": "#607D8B", "query": "musik klasik indonesia"},
-        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2026"},
+        {"id": "viral",      "name": "Viral 🔥",   "color": "#FF5722", "query": "lagu viral tiktok indonesia 2024"},
     ]}
