@@ -175,7 +175,14 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
     ClawCloud = real VM, ga ada SSL block → ini harus selalu jalan.
     """
     try:
-        fmt = "140/251/bestaudio[abr<=130]/bestaudio" if quality == "normal" else "251/140/bestaudio"
+        # Format selector — lebih toleran, cover semua itag yang umum
+        # normal: prioritas m4a 128k → opus → apapun ≤160kbps → best audio → best
+        # high  : prioritas opus 160k → m4a → best audio
+        fmt = (
+            "140/251/250/249/bestaudio[abr<=160]/bestaudio/best"
+            if quality == "normal" else
+            "251/140/250/bestaudio/best"
+        )
 
         # Base args
         args = [
@@ -185,8 +192,9 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=tv_embedded,web",
-            "--add-headers", "X-Youtube-Client-Name:85",
+            # ios client — format pool paling lengkap, no bot detection
+            # web sebagai fallback kalau ios kena restrict
+            "--extractor-args", "youtube:player_client=ios,web",
         ]
 
         # Inject cookies kalau ada
