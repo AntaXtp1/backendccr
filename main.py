@@ -4,6 +4,7 @@ import httpx
 import asyncio
 import os
 import re
+import base64
 from typing import Optional
 import logging
 
@@ -11,6 +12,26 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="iMuzik API", version="1.0.0")
+
+# ─── COOKIES SETUP ───────────────────────────────────────────────────────────
+COOKIES_PATH: Optional[str] = None
+
+@app.on_event("startup")
+async def setup_cookies():
+    global COOKIES_PATH
+    raw = os.getenv("YT_COOKIES_B64", "").strip()
+    if not raw:
+        logger.info("YT_COOKIES_B64 tidak ada — yt-dlp jalan tanpa cookies")
+        return
+    try:
+        decoded = base64.b64decode(raw)
+        cookie_file = "/tmp/cookies.txt"
+        with open(cookie_file, "wb") as f:
+            f.write(decoded)
+        COOKIES_PATH = cookie_file
+        logger.info(f"Cookies berhasil di-load ke {cookie_file} ({len(decoded)} bytes)")
+    except Exception as e:
+        logger.warning(f"Gagal decode/tulis cookies: {e} — yt-dlp jalan tanpa cookies")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 _origins = [
@@ -155,7 +176,9 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
     """
     try:
         fmt = "140/251/bestaudio[abr<=130]/bestaudio" if quality == "normal" else "251/140/bestaudio"
-        proc = await asyncio.create_subprocess_exec(
+
+        # Base args
+        args = [
             "yt-dlp",
             "--get-url",
             "-f", fmt,
@@ -164,7 +187,17 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-check-certificate",
             "--extractor-args", "youtube:player_client=tv_embedded,web",
             "--add-headers", "X-Youtube-Client-Name:85",
-            f"https://www.youtube.com/watch?v={video_id}",
+        ]
+
+        # Inject cookies kalau ada
+        if COOKIES_PATH:
+            args += ["--cookies", COOKIES_PATH]
+            logger.info(f"yt-dlp menggunakan cookies dari {COOKIES_PATH}")
+
+        args.append(f"https://www.youtube.com/watch?v={video_id}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -185,36 +218,41 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
 
 async def resolve_via_invidious(video_id: str, quality: str = "normal") -> Optional[str]:
     """FALLBACK: Invidious instances kalau yt-dlp gagal."""
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=3) as client:
         for instance in INVIDIOUS_INSTANCES:
             try:
                 resp = await client.get(f"{instance}/api/v1/videos/{video_id}")
-                if resp.status_code == 200 and resp.text.strip():
-                    data = resp.json()
-                    # adaptiveFormats = audio-only streams
-                    adaptive = data.get("adaptiveFormats", [])
-                    audio_streams = [
-                        s for s in adaptive
-                        if "audio" in s.get("type", "") and "video" not in s.get("type", "")
-                    ]
-                    if not audio_streams:
-                        continue
+                # 4xx = pasti gagal, skip langsung — jangan buang waktu proses
+                if resp.status_code >= 400:
+                    logger.warning(f"Invidious {instance} → {resp.status_code}, skip")
+                    continue
+                if not resp.text.strip():
+                    continue
+                data = resp.json()
+                # adaptiveFormats = audio-only streams
+                adaptive = data.get("adaptiveFormats", [])
+                audio_streams = [
+                    s for s in adaptive
+                    if "audio" in s.get("type", "") and "video" not in s.get("type", "")
+                ]
+                if not audio_streams:
+                    continue
 
-                    audio_streams.sort(key=lambda x: int(x.get("bitrate", 0)), reverse=True)
-                    if quality == "normal":
-                        # Pilih bitrate ≤130kbps, fallback ke terendah
-                        target = next(
-                            (s for s in reversed(audio_streams) if int(s.get("bitrate", 0)) <= 130000),
-                            audio_streams[-1]
-                        )
-                    else:
-                        target = audio_streams[0]
+                audio_streams.sort(key=lambda x: int(x.get("bitrate", 0)), reverse=True)
+                if quality == "normal":
+                    # Pilih bitrate ≤130kbps, fallback ke terendah
+                    target = next(
+                        (s for s in reversed(audio_streams) if int(s.get("bitrate", 0)) <= 130000),
+                        audio_streams[-1]
+                    )
+                else:
+                    target = audio_streams[0]
 
-                    stream_url = target.get("url")
-                    if stream_url:
-                        kbps = int(target.get("bitrate", 0)) // 1000
-                        logger.info(f"Invidious OK ({instance}): {kbps}kbps")
-                        return stream_url
+                stream_url = target.get("url")
+                if stream_url:
+                    kbps = int(target.get("bitrate", 0)) // 1000
+                    logger.info(f"Invidious OK ({instance}): {kbps}kbps")
+                    return stream_url
             except Exception as e:
                 logger.warning(f"Invidious {instance} failed: {e}")
                 continue
