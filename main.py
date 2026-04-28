@@ -51,13 +51,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── INVIDIOUS INSTANCES ─────────────────────────────────────────────────────
-INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://yewtu.be",
-    "https://invidious.nerdvpn.de",
-]
-
 # ─── YTMUSICAPI INIT ─────────────────────────────────────────────────────────
 try:
     from ytmusicapi import YTMusic
@@ -137,36 +130,6 @@ def ytm_track_to_dict(track: dict) -> dict:
         logger.error(f"Error formatting track: {e}")
         return {}
 
-def invidious_video_to_dict(video: dict) -> dict:
-    """Convert Invidious trending video object ke format iMuzik."""
-    try:
-        video_id = video.get("videoId", "")
-        # Ambil thumbnail resolusi tertinggi dari Invidious
-        thumbs = video.get("videoThumbnails", [])
-        thumbnail = ""
-        if thumbs:
-            # Invidious sort by quality: maxres, high, medium, default
-            priority = ["maxres", "high", "sddefault", "medium", "default"]
-            for prio in priority:
-                match = next((t for t in thumbs if t.get("quality") == prio), None)
-                if match:
-                    thumbnail = match.get("url", "")
-                    break
-            if not thumbnail:
-                thumbnail = thumbs[0].get("url", "")
-        return {
-            "id": video_id,
-            "title": video.get("title", "Unknown"),
-            "artist": video.get("author", "Unknown Artist"),
-            "album": "",
-            "duration": format_duration(video.get("lengthSeconds", 0)),
-            "thumbnail": thumbnail,
-            "videoId": video_id,
-        }
-    except Exception as e:
-        logger.error(f"Error formatting invidious video: {e}")
-        return {}
-
 # ─── STREAM RESOLVERS ────────────────────────────────────────────────────────
 
 async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[str]:
@@ -192,9 +155,11 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            # ios client — format pool paling lengkap, no bot detection
-            # web sebagai fallback kalau ios kena restrict
-            "--extractor-args", "youtube:player_client=ios,web",
+            # ios,mweb,web — triple client fallback
+            # ios: format pool paling lengkap
+            # mweb: expose itag yang kadang ios skip
+            # web: last client resort
+            "--extractor-args", "youtube:player_client=ios,mweb,web",
         ]
 
         # Inject cookies kalau ada
@@ -223,77 +188,6 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
         logger.error(f"yt-dlp error: {e}")
     return None
 
-
-async def resolve_via_invidious(video_id: str, quality: str = "normal") -> Optional[str]:
-    """FALLBACK: Invidious instances kalau yt-dlp gagal."""
-    async with httpx.AsyncClient(timeout=3) as client:
-        for instance in INVIDIOUS_INSTANCES:
-            try:
-                resp = await client.get(f"{instance}/api/v1/videos/{video_id}")
-                # 4xx = pasti gagal, skip langsung — jangan buang waktu proses
-                if resp.status_code >= 400:
-                    logger.warning(f"Invidious {instance} → {resp.status_code}, skip")
-                    continue
-                if not resp.text.strip():
-                    continue
-                data = resp.json()
-                # adaptiveFormats = audio-only streams
-                adaptive = data.get("adaptiveFormats", [])
-                audio_streams = [
-                    s for s in adaptive
-                    if "audio" in s.get("type", "") and "video" not in s.get("type", "")
-                ]
-                if not audio_streams:
-                    continue
-
-                audio_streams.sort(key=lambda x: int(x.get("bitrate", 0)), reverse=True)
-                if quality == "normal":
-                    # Pilih bitrate ≤130kbps, fallback ke terendah
-                    target = next(
-                        (s for s in reversed(audio_streams) if int(s.get("bitrate", 0)) <= 130000),
-                        audio_streams[-1]
-                    )
-                else:
-                    target = audio_streams[0]
-
-                stream_url = target.get("url")
-                if stream_url:
-                    kbps = int(target.get("bitrate", 0)) // 1000
-                    logger.info(f"Invidious OK ({instance}): {kbps}kbps")
-                    return stream_url
-            except Exception as e:
-                logger.warning(f"Invidious {instance} failed: {e}")
-                continue
-    return None
-
-# ─── CHARTS FALLBACK VIA INVIDIOUS ──────────────────────────────────────────
-
-async def get_charts_from_invidious(region: str = "ID") -> dict:
-    """Fallback kalau ytmusicapi down - pakai Invidious trending."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        for instance in INVIDIOUS_INSTANCES:
-            try:
-                resp = await client.get(
-                    f"{instance}/api/v1/trending",
-                    params={"type": "music", "region": region}
-                )
-                if resp.status_code == 200 and resp.text.strip():
-                    videos = resp.json()
-                    if not isinstance(videos, list) or not videos:
-                        continue
-                    tracks = [t for t in [invidious_video_to_dict(v) for v in videos[:30]] if t.get("id")]
-                    if tracks:
-                        logger.info(f"Charts Invidious OK ({instance}): {len(tracks)} tracks")
-                        return {
-                            "trending": tracks[:12],
-                            "top_songs": tracks[12:24],
-                            "top_videos": tracks[24:],
-                            "source": "invidious_fallback",
-                        }
-            except Exception as e:
-                logger.warning(f"Invidious charts {instance} gagal: {e}")
-                continue
-    raise HTTPException(503, "Semua sumber charts gagal")
 
 # ─── API ROUTES ──────────────────────────────────────────────────────────────
 
@@ -354,11 +248,11 @@ async def get_charts(region: str = "ID"):
                 logger.info(f"Charts OK via search: {total} tracks")
                 return result
 
-            logger.warning("ytmusicapi search charts kosong, fallback Invidious")
+            logger.warning("ytmusicapi search charts kosong")
         except Exception as e:
             logger.warning(f"ytmusicapi charts gagal: {e}")
 
-    return await get_charts_from_invidious(region)
+    raise HTTPException(503, "Charts tidak tersedia, ytmusicapi down")
 
 
 @app.get("/search")
@@ -404,9 +298,8 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str
 async def get_stream(video_id: str, quality: str = "normal"):
     """
     Stream resolver priority:
-    1. yt-dlp      ← PRIMARY
-    2. Invidious   ← FALLBACK
-    3. Embed       ← LAST RESORT
+    1. yt-dlp  ← PRIMARY (ios,mweb,web client)
+    2. Embed   ← LAST RESORT
     """
     if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
         raise HTTPException(400, "Invalid video ID")
@@ -414,16 +307,11 @@ async def get_stream(video_id: str, quality: str = "normal"):
     # 1️⃣ yt-dlp
     stream_url = await resolve_via_ytdlp(video_id, quality)
 
-    # 2️⃣ Invidious fallback
-    if not stream_url:
-        logger.info(f"yt-dlp gagal, coba Invidious untuk {video_id}")
-        stream_url = await resolve_via_invidious(video_id, quality)
-
     if stream_url:
         return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality}
 
-    # 3️⃣ Last resort
-    logger.warning(f"Semua resolver gagal untuk {video_id}")
+    # 2️⃣ Last resort — embed
+    logger.warning(f"yt-dlp gagal untuk {video_id}, fallback embed")
     return {
         "url": None,
         "embedUrl": f"https://www.youtube.com/embed/{video_id}?autoplay=1&enablejsapi=1",
