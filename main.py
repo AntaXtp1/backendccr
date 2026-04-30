@@ -177,9 +177,9 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
 
     try:
         fmt = (
-            "140/251/250/249/bestaudio[abr<=160]/bestaudio/best"
+            "140/251/250/249/bestaudio[abr<=160]/bestaudio/best[height<=480]/best"
             if quality == "normal" else
-            "251/140/250/bestaudio/best"
+            "251/140/250/bestaudio/best[height<=720]/best"
         )
 
         args = [
@@ -189,10 +189,8 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            # Fase 1: tv_embedded client — designed for Smart TV, no login needed,
-            # less aggressive bot detection. ios sebagai secondary fallback.
-            "--extractor-args", "youtube:player_client=tv_embedded,ios",
-            "--user-agent", "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+            # web_creator = less restricted, support audio-only formats, lower bot detection
+            "--extractor-args", "youtube:player_client=web_creator,ios",
             "--sleep-requests", "1",
         ]
 
