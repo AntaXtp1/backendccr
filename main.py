@@ -10,6 +10,36 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ─── IN-MEMORY CACHE ─────────────────────────────────────────────────────────
+# Simple dict cache — Redis overkill buat single-instance deployment
+# key → {"data": ..., "ts": float}
+import time as _time
+
+_cache: dict = {}
+_CACHE_TTL = {
+    "charts":  10 * 60,   # 10 menit — charts ga se-realtime itu
+    "search":   5 * 60,   # 5 menit — search result cukup fresh
+}
+
+def cache_get(key: str) -> dict | None:
+    entry = _cache.get(key)
+    if not entry:
+        return None
+    ttl_key = key.split(":")[0]  # "charts", "search", dll
+    ttl = _CACHE_TTL.get(ttl_key, 5 * 60)
+    if _time.monotonic() - entry["ts"] > ttl:
+        del _cache[key]
+        return None
+    return entry["data"]
+
+def cache_set(key: str, data) -> None:
+    # Buang entry lama kalau > 200 (biar ga bloat di memory)
+    if len(_cache) > 200:
+        oldest_key = min(_cache, key=lambda k: _cache[k]["ts"])
+        del _cache[oldest_key]
+    _cache[key] = {"data": data, "ts": _time.monotonic()}
+# ─────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(title="iMuzik API", version="1.0.0")
 
 # ─── COOKIES SETUP ───────────────────────────────────────────────────────────
@@ -253,8 +283,13 @@ async def get_charts(region: str = "ID"):
     Charts via search-based approach (ytmusicapi v1.11.5+).
     v1.11.5 mengubah struktur get_charts() — sekarang return playlist bukan tracks.
     Solusi: pakai search() sebagai proxy trending yang lebih reliable.
-    Fallback: Invidious /api/v1/trending
     """
+    cache_key = f"charts:{region}"
+    cached = cache_get(cache_key)
+    if cached:
+        logger.info(f"Charts cache hit: {region}")
+        return cached
+
     if YTM_AVAILABLE:
         try:
             # v1.11.5+: get_charts() return playlist objects, bukan individual tracks
@@ -289,6 +324,7 @@ async def get_charts(region: str = "ID"):
             total = len(result["top_songs"]) + len(result["trending"]) + len(result["top_videos"])
             if total > 0:
                 logger.info(f"Charts OK via search: {total} tracks")
+                cache_set(cache_key, result)
                 return result
 
             logger.warning("ytmusicapi search charts kosong")
@@ -302,6 +338,13 @@ async def get_charts(region: str = "ID"):
 async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str = "songs"):
     if not YTM_AVAILABLE:
         raise HTTPException(503, "ytmusicapi unavailable")
+
+    cache_key = f"search:{filter}:{q.lower().strip()}:{limit}"
+    cached = cache_get(cache_key)
+    if cached:
+        logger.info(f"Search cache hit: {q!r}")
+        return cached
+
     try:
         filter_map = {
             "songs": "songs", "albums": "albums",
@@ -331,7 +374,9 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str
                     "subscribers": item.get("subscribers", ""),
                 })
 
-        return {"results": formatted, "query": q, "filter": filter}
+        result = {"results": formatted, "query": q, "filter": filter}
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(500, str(e))
