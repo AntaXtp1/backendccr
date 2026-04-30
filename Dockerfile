@@ -15,6 +15,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Update yt-dlp to latest (penting! YouTube sering update)
 RUN yt-dlp -U || true
 
+# ── PO Token provider (bgutil script mode) ───────────────────────────────────
+# Butuh Node.js buat jalanin bgutil script
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install plugin — script mode, generate PO token otomatis tiap yt-dlp call
+RUN pip install bgutil-ytdlp-pot-provider --no-cache-dir --break-system-packages || true
+# ─────────────────────────────────────────────────────────────────────────────
+
 COPY . .
 
 # ClawCloud pakai port 8000, bukan 7860 (itu HF Space)

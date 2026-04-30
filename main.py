@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
 import asyncio
 import os
 import re
@@ -136,18 +135,23 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
     """
     PRIMARY: yt-dlp langsung hit YouTube.
     ClawCloud = real VM, ga ada SSL block → ini harus selalu jalan.
+
+    Early-exit: kalau stderr langsung ngeprint captcha/Sign in keywords,
+    kill process immediately → fallback ~1s, bukan nunggu full 8s timeout.
+    Docker bgutil-ytdlp aware: keyword "bgutil" di stderr = solver aktif, bukan error.
     """
+    # Keywords yang nandain captcha / bot-check — kill early
+    CAPTCHA_KEYWORDS = ("captcha", "sign in", "signin", "bot", "confirm you're not a bot")
+    # Keywords yang nandain bgutil solver lagi kerja — JANGAN kill
+    BGUTIL_OK_KEYWORDS = ("bgutil", "potoken", "po_token")
+
     try:
-        # Format selector — lebih toleran, cover semua itag yang umum
-        # normal: prioritas m4a 128k → opus → apapun ≤160kbps → best audio → best
-        # high  : prioritas opus 160k → m4a → best audio
         fmt = (
             "140/251/250/249/bestaudio[abr<=160]/bestaudio/best"
             if quality == "normal" else
             "251/140/250/bestaudio/best"
         )
 
-        # Base args
         args = [
             "yt-dlp",
             "--get-url",
@@ -155,14 +159,9 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            # ios,mweb,web — triple client fallback
-            # ios: format pool paling lengkap
-            # mweb: expose itag yang kadang ios skip
-            # web: last client resort
             "--extractor-args", "youtube:player_client=ios,mweb,web",
         ]
 
-        # Inject cookies kalau ada
         if COOKIES_PATH:
             args += ["--cookies", COOKIES_PATH]
             logger.info(f"yt-dlp menggunakan cookies dari {COOKIES_PATH}")
@@ -174,16 +173,60 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
+
+        # ── Realtime stderr monitor ───────────────────────────────────────────
+        stderr_chunks: list[bytes] = []
+        captcha_detected = False
+
+        async def watch_stderr():
+            nonlocal captcha_detected
+            async for line in proc.stderr:
+                decoded = line.decode(errors="replace").lower()
+                stderr_chunks.append(line)
+
+                # Kalau bgutil/potoken kedetect → solver lagi aktif, skip kill
+                if any(k in decoded for k in BGUTIL_OK_KEYWORDS):
+                    logger.info(f"bgutil solver aktif ({video_id}), tunggu hasilnya...")
+                    continue
+
+                if any(k in decoded for k in CAPTCHA_KEYWORDS):
+                    captcha_detected = True
+                    logger.warning(f"Captcha/bot-check kedetect early ({video_id}), kill yt-dlp")
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.wait_for(proc.wait(), timeout=8),
+                    watch_stderr(),
+                ),
+                timeout=9,  # outer safety net
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"yt-dlp timeout (8s) - {video_id} skip ke fallback")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return None
+
+        if captcha_detected:
+            return None
+
+        stdout_data = await proc.stdout.read()
         if proc.returncode == 0:
-            url = stdout.decode().strip().split("\n")[0]
+            url = stdout_data.decode().strip().split("\n")[0]
             if url.startswith("http"):
                 logger.info(f"yt-dlp OK: {video_id}")
                 return url
         else:
-            logger.warning(f"yt-dlp gagal: {stderr.decode()[:200]}")
-    except asyncio.TimeoutError:
-        logger.error("yt-dlp timeout (8s) - skip ke fallback")
+            full_stderr = b"".join(stderr_chunks).decode(errors="replace")
+            logger.warning(f"yt-dlp gagal: {full_stderr[:200]}")
+
     except Exception as e:
         logger.error(f"yt-dlp error: {e}")
     return None
