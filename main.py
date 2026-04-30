@@ -189,7 +189,11 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=ios,mweb,web",
+            # Fase 1: tv_embedded client — designed for Smart TV, no login needed,
+            # less aggressive bot detection. ios sebagai secondary fallback.
+            "--extractor-args", "youtube:player_client=tv_embedded,ios",
+            "--user-agent", "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+            "--sleep-requests", "1",
         ]
 
         if COOKIES_PATH:
