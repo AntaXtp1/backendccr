@@ -43,138 +43,169 @@ def cache_set(key: str, data) -> None:
 
 app = FastAPI(title="iMuzik API", version="1.0.0")
 
-# ─── COOKIES SETUP ───────────────────────────────────────────────────────────
-# Priority: Playwright warmer (auto-generated) > YT_COOKIES_B64 (manual env)
-COOKIES_PATH: Optional[str] = "/tmp/yt_cookies_playwright.txt"
-_PLAYWRIGHT_AVAILABLE = False
-_cookie_refresh_task: Optional[asyncio.Task] = None
-_COOKIE_REFRESH_INTERVAL = 60 * 60  # refresh tiap 1 jam
+# ─── PLAYWRIGHT PERSISTENT BROWSER ──────────────────────────────────────────
+# 1 Chromium instance hidup terus — ga spawn/mati tiap request
+# Context di-recycle tiap 2 jam buat fresh session
+# Stream URL di-intercept dari network request ke googlevideo.com
 
-async def warm_cookies_playwright() -> bool:
-    """
-    Spawn Chromium headless sekali, buka YouTube, export cookies ke Netscape format.
-    Browser langsung mati setelah selesai — ga makan RAM terus-terusan.
-    Return True kalau berhasil, False kalau gagal.
-    """
-    global COOKIES_PATH, _PLAYWRIGHT_AVAILABLE
+COOKIES_PATH: Optional[str] = None          # fallback yt-dlp manual cookies
+_pw_browser  = None                          # playwright Browser object
+_pw_context  = None                          # playwright BrowserContext
+_pw_lock     = asyncio.Lock()               # 1 scrape at a time (RAM safe)
+_pw_ready    = False
+_browser_refresh_task: Optional[asyncio.Task] = None
+_BROWSER_REFRESH_INTERVAL = 2 * 60 * 60    # recycle context tiap 2 jam
+
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--no-first-run",
+    "--mute-audio",
+    # Anti-detection: sembunyiin tanda headless
+    "--disable-blink-features=AutomationControlled",
+]
+
+YT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+async def _init_browser() -> bool:
+    """Launch Chromium + buat context baru. Return True kalau sukses."""
+    global _pw_browser, _pw_context, _pw_ready
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        logger.warning("Playwright tidak terinstall — skip cookie warmer")
+        logger.warning("Playwright tidak terinstall")
         return False
 
-    cookie_file = "/tmp/yt_cookies_playwright.txt"
     try:
-        logger.info("Playwright: spawning Chromium untuk warm up YouTube cookies...")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",  # penting buat Docker RAM terbatas
-                    "--disable-gpu",
-                    "--single-process",
-                ],
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-            )
-            page = await context.new_page()
+        logger.info("Playwright: launching Chromium persistent...")
+        # Simpan instance playwright supaya bisa di-close proper
+        _pw_playwright = await async_playwright().__aenter__()
+        _pw_browser = await _pw_playwright.chromium.launch(
+            headless=True,
+            args=CHROMIUM_ARGS,
+        )
+        _pw_context = await _pw_browser.new_context(
+            user_agent=YT_UA,
+            viewport={"width": 1280, "height": 720},
+            # Patch navigator.webdriver = false via JS
+            java_script_enabled=True,
+        )
+        # Inject stealth script — hapus jejak automation di setiap page baru
+        await _pw_context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
 
-            # Buka YouTube Music — trigger consent + cookies
-            await page.goto("https://music.youtube.com", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)  # tunggu JS settle
+        # Warm up session: buka YT sekali biar cookies ter-set
+        page = await _pw_context.new_page()
+        await page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        await page.close()
 
-            # Coba dismiss consent page kalau muncul (EU consent, dll)
-            try:
-                await page.click("button[aria-label*='Accept']", timeout=3000)
-                await asyncio.sleep(1)
-            except Exception:
-                pass  # ga ada consent page, skip
-
-            # Export cookies ke format Netscape (yang bisa dibaca yt-dlp)
-            cookies = await context.cookies()
-            await browser.close()
-
-        if not cookies:
-            logger.warning("Playwright: cookies kosong, YouTube mungkin block headless")
-            return False
-
-        # Tulis ke format Netscape HTTP Cookie File
-        with open(cookie_file, "w") as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            f.write("# Generated by iMuzik Playwright warmer\n\n")
-            for c in cookies:
-                domain = c.get("domain", "")
-                flag = "TRUE" if domain.startswith(".") else "FALSE"
-                secure = "TRUE" if c.get("secure", False) else "FALSE"
-                expires = int(c.get("expires", 0)) if c.get("expires") else 0
-                name = c.get("name", "")
-                value = c.get("value", "")
-                path = c.get("path", "/")
-                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
-
-        COOKIES_PATH = cookie_file
-        _PLAYWRIGHT_AVAILABLE = True
-        logger.info(f"Playwright: {len(cookies)} cookies berhasil di-export ke {cookie_file}")
+        _pw_ready = True
+        logger.info("Playwright: Chromium ready ✓")
         return True
-
     except Exception as e:
-        logger.warning(f"Playwright cookie warmer gagal: {e}")
+        logger.error(f"Playwright init gagal: {e}")
+        _pw_ready = False
         return False
 
 
-async def _cookie_refresh_loop():
-    """Background task: refresh cookies tiap 1 jam."""
+async def _recycle_context():
+    """Buat context baru tanpa restart browser — fresh session tiap 2 jam."""
+    global _pw_context, _pw_ready
+    if not _pw_browser:
+        return
+    try:
+        logger.info("Playwright: recycling browser context...")
+        old_ctx = _pw_context
+        _pw_context = await _pw_browser.new_context(
+            user_agent=YT_UA,
+            viewport={"width": 1280, "height": 720},
+            java_script_enabled=True,
+        )
+        await _pw_context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+        # Warm up context baru
+        page = await _pw_context.new_page()
+        await page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        await page.close()
+
+        # Tutup context lama setelah yang baru siap
+        try:
+            await old_ctx.close()
+        except Exception:
+            pass
+
+        _pw_ready = True
+        logger.info("Playwright: context recycled ✓")
+    except Exception as e:
+        logger.error(f"Playwright recycle gagal: {e}")
+
+
+async def _browser_refresh_loop():
+    """Background task: recycle context tiap 2 jam."""
     while True:
-        await asyncio.sleep(_COOKIE_REFRESH_INTERVAL)
-        logger.info("Cookie refresh: menjalankan Playwright warmer ulang...")
-        await warm_cookies_playwright()
+        await asyncio.sleep(_BROWSER_REFRESH_INTERVAL)
+        await _recycle_context()
 
 
 @app.on_event("startup")
-async def setup_cookies():
-    global COOKIES_PATH, _cookie_refresh_task
+async def startup():
+    global COOKIES_PATH, _browser_refresh_task
 
-    # 1️⃣ Coba Playwright warmer dulu
-    pw_ok = await warm_cookies_playwright()
-
+    # 1️⃣ Init persistent Playwright browser
+    pw_ok = await _init_browser()
     if pw_ok:
-        logger.info("Cookie setup: Playwright warmer sukses ✓")
-        # Jalankan background refresh loop
-        _cookie_refresh_task = asyncio.create_task(_cookie_refresh_loop())
-        return
+        _browser_refresh_task = asyncio.create_task(_browser_refresh_loop())
+        logger.info("Startup: Playwright persistent browser aktif ✓")
+    else:
+        logger.warning("Startup: Playwright gagal — hanya embed fallback tersedia")
 
-    # 2️⃣ Fallback ke manual cookies dari env var
-    logger.info("Playwright gagal — fallback ke YT_COOKIES_B64 env var")
+    # 2️⃣ Load manual cookies (opsional, buat yt-dlp fallback)
     raw = os.getenv("YT_COOKIES_B64", "").strip()
-    if not raw:
-        logger.info("YT_COOKIES_B64 tidak ada — yt-dlp jalan tanpa cookies")
-        COOKIES_PATH = None
-        return
-    try:
-        decoded = base64.b64decode(raw)
-        cookie_file = "/tmp/cookies_manual.txt"
-        with open(cookie_file, "wb") as f:
-            f.write(decoded)
-        COOKIES_PATH = cookie_file
-        logger.info(f"Manual cookies berhasil di-load ke {cookie_file} ({len(decoded)} bytes)")
-    except Exception as e:
-        logger.warning(f"Gagal decode/tulis manual cookies: {e} — yt-dlp jalan tanpa cookies")
-        COOKIES_PATH = None
+    if raw:
+        try:
+            decoded = base64.b64decode(raw)
+            cookie_file = "/tmp/cookies_manual.txt"
+            with open(cookie_file, "wb") as f:
+                f.write(decoded)
+            COOKIES_PATH = cookie_file
+            logger.info(f"Manual cookies loaded: {cookie_file}")
+        except Exception as e:
+            logger.warning(f"Gagal load manual cookies: {e}")
 
 
 @app.on_event("shutdown")
-async def cleanup():
-    global _cookie_refresh_task
-    if _cookie_refresh_task:
-        _cookie_refresh_task.cancel()
+async def shutdown():
+    global _browser_refresh_task, _pw_browser, _pw_context
+    if _browser_refresh_task:
+        _browser_refresh_task.cancel()
         try:
-            await _cookie_refresh_task
+            await _browser_refresh_task
         except asyncio.CancelledError:
             pass
+    try:
+        if _pw_context: await _pw_context.close()
+        if _pw_browser: await _pw_browser.close()
+    except Exception:
+        pass
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 _origins = [
@@ -275,14 +306,102 @@ def ytm_track_to_dict(track: dict) -> dict:
 
 # ─── STREAM RESOLVERS ────────────────────────────────────────────────────────
 
+# Cache stream URL — TTL 5 jam (googlevideo URL expire ~6 jam)
+_stream_cache: dict = {}
+_STREAM_CACHE_TTL = 5 * 60 * 60  # 5 jam dalam detik
+
+def _stream_cache_get(video_id: str, quality: str) -> Optional[str]:
+    key = f"{video_id}_{quality}"
+    entry = _stream_cache.get(key)
+    if not entry:
+        return None
+    if _time.monotonic() - entry["ts"] > _STREAM_CACHE_TTL:
+        del _stream_cache[key]
+        return None
+    return entry["url"]
+
+def _stream_cache_set(video_id: str, quality: str, url: str):
+    key = f"{video_id}_{quality}"
+    # Max 50 entry — buang yang paling lama
+    if len(_stream_cache) >= 50:
+        oldest = min(_stream_cache, key=lambda k: _stream_cache[k]["ts"])
+        del _stream_cache[oldest]
+    _stream_cache[key] = {"url": url, "ts": _time.monotonic()}
+
+
+async def resolve_via_playwright(video_id: str, quality: str = "normal") -> Optional[str]:
+    """
+    PRIMARY: Intercept stream URL dari network request browser.
+    Buka /watch?v={id}, tangkap request ke googlevideo.com dengan itag audio.
+    Timeout 15 detik — kalau lewat, return None dan fallback ke yt-dlp.
+    Lock: 1 scrape at a time biar ga OOM.
+    """
+    global _pw_ready, _pw_context
+
+    if not _pw_ready or not _pw_context:
+        logger.warning("Playwright belum ready — skip ke yt-dlp")
+        return None
+
+    # itag audio: 140=m4a/128k (normal), 251=webm/160k (high)
+    AUDIO_ITAGS = {"140", "251", "250", "249"}
+    target_itag = "251" if quality == "high" else "140"
+
+    async with _pw_lock:
+        page = None
+        try:
+            page = await _pw_context.new_page()
+            captured_url: list[str] = []
+
+            # Intercept semua request ke googlevideo
+            async def handle_request(request):
+                url = request.url
+                if "googlevideo.com" in url and "videoplayback" in url:
+                    # Cek itag di URL
+                    for itag in AUDIO_ITAGS:
+                        if f"itag={itag}" in url:
+                            captured_url.append(url)
+                            logger.info(f"Playwright: captured stream itag={itag} untuk {video_id}")
+                            return
+
+            page.on("request", handle_request)
+
+            # Buka halaman YT — pake embed nocookie biar lebih ringan + less bot detection
+            yt_url = f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1"
+            await page.goto(yt_url, wait_until="domcontentloaded", timeout=20000)
+
+            # Tunggu sampai URL ke-capture atau timeout 12 detik
+            deadline = _time.monotonic() + 12
+            while not captured_url and _time.monotonic() < deadline:
+                await asyncio.sleep(0.3)
+
+            if captured_url:
+                url = captured_url[0]
+                _stream_cache_set(video_id, quality, url)
+                logger.info(f"Playwright resolve OK: {video_id}")
+                return url
+            else:
+                logger.warning(f"Playwright: stream URL tidak ke-capture untuk {video_id}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Playwright scrape error {video_id}: {e}")
+            return None
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+
+
 async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[str]:
     """
-    PRIMARY: yt-dlp langsung hit YouTube.
-    ClawCloud = real VM, ga ada SSL block → ini harus selalu jalan.
+    SECONDARY: yt-dlp langsung hit YouTube.
+    Fallback kalau Playwright gagal intercept URL.
 
     Early-exit: kalau stderr langsung ngeprint captcha/Sign in keywords,
     kill process immediately → fallback ~1s, bukan nunggu full 8s timeout.
-    Docker bgutil-ytdlp aware: keyword "bgutil" di stderr = solver aktif, bukan error.
     """
     # Keywords yang nandain captcha / bot-check — kill early
     CAPTCHA_KEYWORDS = ("captcha", "sign in", "signin", "bot", "confirm you're not a bot")
@@ -501,20 +620,33 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str
 async def get_stream(video_id: str, quality: str = "normal"):
     """
     Stream resolver priority:
-    1. yt-dlp  ← PRIMARY (ios,mweb,web client)
-    2. Embed   ← LAST RESORT
+    1. Cache      ← instant return kalau URL masih fresh
+    2. Playwright ← intercept googlevideo URL via headless browser
+    3. yt-dlp     ← fallback kalau Playwright gagal
+    4. Embed      ← last resort (kena Background Tab Throttling)
     """
     if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
         raise HTTPException(400, "Invalid video ID")
 
-    # 1️⃣ yt-dlp
-    stream_url = await resolve_via_ytdlp(video_id, quality)
+    # 1️⃣ Cache hit
+    cached = _stream_cache_get(video_id, quality)
+    if cached:
+        logger.info(f"Stream cache hit: {video_id}")
+        return {"url": cached, "videoId": video_id, "method": "stream", "quality": quality, "source": "cache"}
 
+    # 2️⃣ Playwright scraper
+    stream_url = await resolve_via_playwright(video_id, quality)
     if stream_url:
-        return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality}
+        return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "playwright"}
 
-    # 2️⃣ Last resort — embed
-    logger.warning(f"yt-dlp gagal untuk {video_id}, fallback embed")
+    # 3️⃣ yt-dlp fallback
+    stream_url = await resolve_via_ytdlp(video_id, quality)
+    if stream_url:
+        _stream_cache_set(video_id, quality, stream_url)
+        return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "ytdlp"}
+
+    # 4️⃣ Last resort — embed (kena throttle kalau background tab)
+    logger.warning(f"Semua resolver gagal untuk {video_id}, fallback embed")
     return {
         "url": None,
         "embedUrl": f"https://www.youtube.com/embed/{video_id}?autoplay=1&enablejsapi=1",
