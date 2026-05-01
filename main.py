@@ -337,31 +337,52 @@ async def resolve_via_playwright(video_id: str, quality: str = "normal") -> Opti
             page = await _pw_context.new_page()
             captured_url: list[str] = []
 
-            # Intercept semua request ke googlevideo
-            async def handle_request(request):
-                url = request.url
+            # Intercept via RESPONSE — lebih reliable dari request
+            # karena beberapa request ke googlevideo pakai redirect chain
+            async def handle_response(response):
+                url = response.url
                 if "googlevideo.com" in url and "videoplayback" in url:
-                    # Cek itag di URL
                     for itag in AUDIO_ITAGS:
                         if f"itag={itag}" in url:
                             captured_url.append(url)
-                            logger.info(f"Playwright: captured stream itag={itag} untuk {video_id}")
+                            logger.info(f"Playwright: captured itag={itag} untuk {video_id}")
                             return
 
-            page.on("request", handle_request)
+            page.on("response", handle_response)
 
-            # Buka halaman YT — pake embed nocookie biar lebih ringan + less bot detection
-            yt_url = f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1"
+            # Buka watch page biasa — lebih reliable trigger video load vs embed
+            # nocookie embed butuh user gesture buat autoplay, watch page tidak
+            yt_url = f"https://www.youtube.com/watch?v={video_id}"
             try:
-                await page.goto(yt_url, wait_until="domcontentloaded", timeout=20000)
+                await page.goto(yt_url, wait_until="domcontentloaded", timeout=25000)
             except Exception as nav_err:
-                logger.warning(f"Playwright: goto timeout/error untuk {video_id}: {nav_err}")
+                logger.warning(f"Playwright: goto error {video_id}: {nav_err}")
                 return None
 
-            # Tunggu sampai URL ke-capture atau timeout 12 detik
-            deadline = _time.monotonic() + 12
+            # Tunggu halaman settle dulu
+            await asyncio.sleep(2)
+
+            # Trigger play via JS — bypass autoplay policy
+            # YT player ada di #movie_player, method playVideo() tersedia
+            try:
+                await page.evaluate("""
+                    () => {
+                        const player = document.getElementById('movie_player');
+                        if (player && player.playVideo) {
+                            player.playVideo();
+                        }
+                        // Fallback: klik tombol play kalau playVideo() ga ada
+                        const btn = document.querySelector('button.ytp-play-button');
+                        if (btn) btn.click();
+                    }
+                """)
+            except Exception:
+                pass  # kalau JS gagal, tetap tunggu — mungkin autoplay udah jalan
+
+            # Tunggu sampai URL ke-capture, max 15 detik
+            deadline = _time.monotonic() + 15
             while not captured_url and _time.monotonic() < deadline:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.4)
 
             if captured_url:
                 url = captured_url[0]
@@ -369,7 +390,7 @@ async def resolve_via_playwright(video_id: str, quality: str = "normal") -> Opti
                 logger.info(f"Playwright resolve OK: {video_id}")
                 return url
             else:
-                logger.warning(f"Playwright: stream URL tidak ke-capture untuk {video_id}")
+                logger.warning(f"Playwright: tidak ada googlevideo request untuk {video_id}")
                 return None
 
         except Exception as e:
@@ -398,10 +419,12 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
     BGUTIL_OK_KEYWORDS = ("bgutil", "potoken", "po_token")
 
     try:
+        # Format priority: audio-only dulu, kalau ga ada ambil best apapun
+        # "best" di akhir = absolute fallback, pasti ada selama video accessible
         fmt = (
-            "140/251/250/249/bestaudio[abr<=160]/bestaudio/best"
+            "140/250/249/251/bestaudio/best"
             if quality == "normal" else
-            "251/140/250/bestaudio/best"
+            "251/140/250/249/bestaudio/best"
         )
 
         args = [
