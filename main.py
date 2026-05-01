@@ -107,14 +107,10 @@ async def _init_browser() -> bool:
             window.chrome = { runtime: {} };
         """)
 
-        # Warm up session: buka YT sekali biar cookies ter-set
-        page = await _pw_context.new_page()
-        await page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-        await page.close()
-
+        # Skip warm up — langsung mark ready, context akan di-init saat request pertama
+        # Warm up via youtube.com sering timeout di restricted environment
         _pw_ready = True
-        logger.info("Playwright: Chromium ready ✓")
+        logger.info("Playwright: Chromium ready ✓ (lazy warm up)")
         return True
     except Exception as e:
         logger.error(f"Playwright init gagal: {e}")
@@ -141,18 +137,7 @@ async def _recycle_context():
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             window.chrome = { runtime: {} };
         """)
-        # Warm up context baru
-        page = await _pw_context.new_page()
-        await page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-        await page.close()
-
-        # Tutup context lama setelah yang baru siap
-        try:
-            await old_ctx.close()
-        except Exception:
-            pass
-
+        # Skip warm up — langsung mark ready
         _pw_ready = True
         logger.info("Playwright: context recycled ✓")
     except Exception as e:
@@ -367,7 +352,11 @@ async def resolve_via_playwright(video_id: str, quality: str = "normal") -> Opti
 
             # Buka halaman YT — pake embed nocookie biar lebih ringan + less bot detection
             yt_url = f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1"
-            await page.goto(yt_url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                await page.goto(yt_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as nav_err:
+                logger.warning(f"Playwright: goto timeout/error untuk {video_id}: {nav_err}")
+                return None
 
             # Tunggu sampai URL ke-capture atau timeout 12 detik
             deadline = _time.monotonic() + 12
