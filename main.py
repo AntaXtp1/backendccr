@@ -405,6 +405,141 @@ async def resolve_via_playwright(video_id: str, quality: str = "normal") -> Opti
 
 
 
+# ─── SOUNDCLOUD RESOLVER ─────────────────────────────────────────────────────
+SC_CLIENT_ID = os.getenv("SC_CLIENT_ID", "1Gbi6DBGBMULQH8MuhNvI1HzL9AiX2Pa")
+SC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://soundcloud.com/",
+    "Origin": "https://soundcloud.com",
+}
+
+# Cache SC search result — biar lagu yang sama ga search ulang (TTL 24 jam)
+_sc_search_cache: dict = {}
+_SC_SEARCH_TTL = 24 * 60 * 60
+
+def _sc_cache_get(key: str) -> Optional[str]:
+    entry = _sc_search_cache.get(key)
+    if not entry:
+        return None
+    if _time.monotonic() - entry["ts"] > _SC_SEARCH_TTL:
+        del _sc_search_cache[key]
+        return None
+    return entry["url"]
+
+def _sc_cache_set(key: str, url: str):
+    if len(_sc_search_cache) >= 100:
+        oldest = min(_sc_search_cache, key=lambda k: _sc_search_cache[k]["ts"])
+        del _sc_search_cache[oldest]
+    _sc_search_cache[key] = {"url": url, "ts": _time.monotonic()}
+
+
+async def resolve_via_soundcloud(title: str, artist: str) -> Optional[str]:
+    """
+    PRIMARY resolver: cari lagu di SoundCloud pakai title+artist,
+    ambil HLS stream URL dari transcoding.
+    Return None kalau ga ketemu atau SC error.
+    """
+    cache_key = f"{title}_{artist}".lower().strip()
+    cached = _sc_cache_get(cache_key)
+    if cached:
+        logger.info(f"SC cache hit: {title}")
+        return cached
+
+    query = f"{artist} {title}".strip()
+    try:
+        async with httpx.AsyncClient(timeout=8, headers=SC_HEADERS) as hc:
+            # 1. Search track
+            r = await hc.get(
+                "https://api-v2.soundcloud.com/search/tracks",
+                params={
+                    "q": query,
+                    "client_id": SC_CLIENT_ID,
+                    "limit": 5,
+                    "filter.downloadable": "false",
+                }
+            )
+            if r.status_code != 200:
+                logger.warning(f"SC search failed: {r.status_code} untuk '{query}'")
+                return None
+
+            tracks = r.json().get("collection", [])
+            if not tracks:
+                logger.warning(f"SC: tidak ada hasil untuk '{query}'")
+                return None
+
+            # Pilih track terbaik — prioritas: streamable + judul paling mirip
+            best = None
+            query_lower = query.lower()
+            for t in tracks:
+                if not t.get("streamable"):
+                    continue
+                # Simple match: cek apakah title track mengandung artist atau title query
+                track_title = t.get("title", "").lower()
+                track_user = t.get("user", {}).get("username", "").lower()
+                artist_lower = artist.lower()
+                title_lower = title.lower()
+                if artist_lower in track_title or artist_lower in track_user or title_lower in track_title:
+                    best = t
+                    break
+
+            # Kalau ga ada yang match proper, ambil hasil pertama yang streamable
+            if not best:
+                for t in tracks:
+                    if t.get("streamable"):
+                        best = t
+                        break
+
+            if not best:
+                logger.warning(f"SC: tidak ada track streamable untuk '{query}'")
+                return None
+
+            logger.info(f"SC match: '{best.get('title')}' untuk query '{query}'")
+
+            # 2. Resolve HLS stream URL dari transcoding
+            transcodings = best.get("media", {}).get("transcodings", [])
+            hls_tc = next(
+                (tc for tc in transcodings if tc.get("format", {}).get("protocol") == "hls"),
+                None
+            )
+            if not hls_tc:
+                logger.warning(f"SC: tidak ada HLS transcoding untuk '{query}'")
+                return None
+
+            r2 = await hc.get(
+                hls_tc["url"],
+                params={"client_id": SC_CLIENT_ID},
+                headers=SC_HEADERS,
+            )
+            if r2.status_code != 200:
+                logger.warning(f"SC transcoding resolve failed: {r2.status_code}")
+                return None
+
+            stream_url = r2.json().get("url")
+            if not stream_url:
+                return None
+
+            _sc_cache_set(cache_key, stream_url)
+            logger.info(f"SC resolve OK: '{best.get('title')}'")
+            return stream_url
+
+    except Exception as e:
+        logger.error(f"SC resolver error: {e}")
+        return None
+
+
+async def _get_track_meta(video_id: str) -> tuple[str, str]:
+    """Ambil title + artist dari YTMusic buat dipakai SC search."""
+    try:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, lambda: ytmusic.get_song(video_id))
+        details = info.get("videoDetails", {})
+        title = details.get("title", "")
+        artist = details.get("author", "")
+        return title, artist
+    except Exception:
+        return "", ""
+
+
 async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[str]:
     """
     SECONDARY: yt-dlp langsung hit YouTube.
@@ -632,27 +767,35 @@ async def search(q: str = Query(..., min_length=1), limit: int = 20, filter: str
 async def get_stream(video_id: str, quality: str = "normal"):
     """
     Stream resolver priority:
-    1. Cache      ← instant return kalau URL masih fresh
-    2. Playwright ← intercept googlevideo URL via headless browser
-    3. yt-dlp     ← fallback kalau Playwright gagal
-    4. Embed      ← last resort (kena Background Tab Throttling)
+    1. Cache         ← instant
+    2. SoundCloud    ← primary, HLS native audio, no throttle
+    3. yt-dlp        ← secondary fallback
+    4. Embed         ← last resort (background tab throttle)
     """
     if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
         raise HTTPException(400, "Invalid video ID")
 
-    # 1️⃣ Cache hit
+    # 1️⃣ Cache hit — stream URL (SC atau yt-dlp) masih fresh
     cached = _stream_cache_get(video_id, quality)
     if cached:
         logger.info(f"Stream cache hit: {video_id}")
         return {"url": cached, "videoId": video_id, "method": "stream", "quality": quality, "source": "cache"}
 
-    # 2️⃣ yt-dlp (Playwright disabled — ClawCloud block Chromium ke YT)
+    # 2️⃣ SoundCloud — ambil metadata dulu, terus search SC
+    title, artist = await _get_track_meta(video_id)
+    if title:
+        sc_url = await resolve_via_soundcloud(title, artist)
+        if sc_url:
+            _stream_cache_set(video_id, quality, sc_url)
+            return {"url": sc_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "soundcloud"}
+
+    # 3️⃣ yt-dlp fallback
     stream_url = await resolve_via_ytdlp(video_id, quality)
     if stream_url:
         _stream_cache_set(video_id, quality, stream_url)
         return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "ytdlp"}
 
-    # 3️⃣ Last resort — embed
+    # 4️⃣ Last resort — embed
     logger.warning(f"Semua resolver gagal untuk {video_id}, fallback embed")
     return {
         "url": None,
@@ -729,61 +872,6 @@ async def get_artist(channel_id: str):
         raise HTTPException(500, str(e))
 
 
-# ─── DEBUG ENDPOINT — HAPUS SETELAH TEST ─────────────────────────────────────
-@app.get("/debug/sc-test")
-async def debug_sc_test():
-    """Test apakah SoundCloud API bisa diakses dari ClawCloud IP ini."""
-    import httpx
-    SC_CLIENT_ID = "1Gbi6DBGBMULQH8MuhNvI1HzL9AiX2Pa"
-    results = {}
-
-    # Test 1: Search track
-    try:
-        async with httpx.AsyncClient(timeout=8) as hc:
-            r = await hc.get(
-                "https://api-v2.soundcloud.com/search/tracks",
-                params={"q": "Kunto Aji", "client_id": SC_CLIENT_ID, "limit": 2},
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            )
-            results["search_status"] = r.status_code
-            if r.status_code == 200:
-                data = r.json()
-                tracks = data.get("collection", [])
-                results["tracks_found"] = len(tracks)
-                if tracks:
-                    t = tracks[0]
-                    results["sample_track"] = t.get("title")
-                    results["sample_id"] = t.get("id")
-                    # Test 2: Ambil stream URL dari transcoding
-                    transcodings = t.get("media", {}).get("transcodings", [])
-                    results["transcodings"] = len(transcodings)
-                    if transcodings:
-                        # Coba semua transcoding sampai ada yang work
-                        for tc in transcodings:
-                            stream_url_endpoint = tc["url"]
-                            protocol = tc.get("format", {}).get("protocol", "")
-                            results[f"transcoding_{protocol}"] = stream_url_endpoint[:60]
-                            r2 = await hc.get(
-                                stream_url_endpoint,
-                                params={"client_id": SC_CLIENT_ID},
-                                headers={
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                                    "Referer": "https://soundcloud.com/",
-                                    "Origin": "https://soundcloud.com",
-                                }
-                            )
-                            results[f"stream_status_{protocol}"] = r2.status_code
-                            if r2.status_code == 200:
-                                results["stream_url_preview"] = r2.json().get("url", "")[:80] + "..."
-                                results["WORKING_PROTOCOL"] = protocol
-                                break
-            else:
-                results["error_body"] = r.text[:200]
-    except Exception as e:
-        results["exception"] = str(e)
-
-    return results
-# ─────────────────────────────────────────────────────────────────────────────
 async def get_genres():
     return {"genres": [
         {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2026"},
