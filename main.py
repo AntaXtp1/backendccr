@@ -196,7 +196,7 @@ async def shutdown():
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://play-muzix.vercel.app",
+    "https://i-muzix.vercel.app",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -729,7 +729,51 @@ async def get_artist(channel_id: str):
         raise HTTPException(500, str(e))
 
 
-@app.get("/genres")
+# ─── DEBUG ENDPOINT — HAPUS SETELAH TEST ─────────────────────────────────────
+@app.get("/debug/sc-test")
+async def debug_sc_test():
+    """Test apakah SoundCloud API bisa diakses dari ClawCloud IP ini."""
+    import httpx
+    SC_CLIENT_ID = "1Gbi6DBGBMULQH8MuhNvI1HzL9AiX2Pa"
+    results = {}
+
+    # Test 1: Search track
+    try:
+        async with httpx.AsyncClient(timeout=8) as hc:
+            r = await hc.get(
+                "https://api-v2.soundcloud.com/search/tracks",
+                params={"q": "Kunto Aji", "client_id": SC_CLIENT_ID, "limit": 2},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            results["search_status"] = r.status_code
+            if r.status_code == 200:
+                data = r.json()
+                tracks = data.get("collection", [])
+                results["tracks_found"] = len(tracks)
+                if tracks:
+                    t = tracks[0]
+                    results["sample_track"] = t.get("title")
+                    results["sample_id"] = t.get("id")
+                    # Test 2: Ambil stream URL dari transcoding
+                    transcodings = t.get("media", {}).get("transcodings", [])
+                    results["transcodings"] = len(transcodings)
+                    if transcodings:
+                        stream_url_endpoint = transcodings[0]["url"]
+                        r2 = await hc.get(
+                            stream_url_endpoint,
+                            params={"client_id": SC_CLIENT_ID},
+                            headers={"User-Agent": "Mozilla/5.0"}
+                        )
+                        results["stream_resolve_status"] = r2.status_code
+                        if r2.status_code == 200:
+                            results["stream_url_preview"] = r2.json().get("url", "")[:80] + "..."
+            else:
+                results["error_body"] = r.text[:200]
+    except Exception as e:
+        results["exception"] = str(e)
+
+    return results
+# ─────────────────────────────────────────────────────────────────────────────
 async def get_genres():
     return {"genres": [
         {"id": "pop",        "name": "Pop",        "color": "#C8FF3E", "query": "pop indonesia 2026"},
