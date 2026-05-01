@@ -196,7 +196,7 @@ async def shutdown():
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://play-muzix.vercel.app",
+    "https://i-muzix.vercel.app",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
@@ -419,12 +419,12 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
     BGUTIL_OK_KEYWORDS = ("bgutil", "potoken", "po_token")
 
     try:
-        # Format priority: audio-only dulu, kalau ga ada ambil best apapun
-        # "best" di akhir = absolute fallback, pasti ada selama video accessible
+        # 140 = m4a audio (ios serve ini), 250/249 = webm opus
+        # bestaudio* = any audio-only stream apapun formatnya
         fmt = (
-            "140/250/249/251/bestaudio/best"
+            "140/250/249/bestaudio*/bestaudio"
             if quality == "normal" else
-            "251/140/250/249/bestaudio/best"
+            "140/250/249/bestaudio*/bestaudio"
         )
 
         args = [
@@ -434,7 +434,7 @@ async def resolve_via_ytdlp(video_id: str, quality: str = "normal") -> Optional[
             "--no-playlist",
             "--no-warnings",
             "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=ios,web",
+            "--extractor-args", "youtube:player_client=ios",
             "--sleep-requests", "1",
         ]
 
@@ -646,18 +646,13 @@ async def get_stream(video_id: str, quality: str = "normal"):
         logger.info(f"Stream cache hit: {video_id}")
         return {"url": cached, "videoId": video_id, "method": "stream", "quality": quality, "source": "cache"}
 
-    # 2️⃣ Playwright scraper
-    stream_url = await resolve_via_playwright(video_id, quality)
-    if stream_url:
-        return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "playwright"}
-
-    # 3️⃣ yt-dlp fallback
+    # 2️⃣ yt-dlp (Playwright disabled — ClawCloud block Chromium ke YT)
     stream_url = await resolve_via_ytdlp(video_id, quality)
     if stream_url:
         _stream_cache_set(video_id, quality, stream_url)
         return {"url": stream_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "ytdlp"}
 
-    # 4️⃣ Last resort — embed (kena throttle kalau background tab)
+    # 3️⃣ Last resort — embed
     logger.warning(f"Semua resolver gagal untuk {video_id}, fallback embed")
     return {
         "url": None,
