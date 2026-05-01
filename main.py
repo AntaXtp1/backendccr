@@ -758,15 +758,25 @@ async def debug_sc_test():
                     transcodings = t.get("media", {}).get("transcodings", [])
                     results["transcodings"] = len(transcodings)
                     if transcodings:
-                        stream_url_endpoint = transcodings[0]["url"]
-                        r2 = await hc.get(
-                            stream_url_endpoint,
-                            params={"client_id": SC_CLIENT_ID},
-                            headers={"User-Agent": "Mozilla/5.0"}
-                        )
-                        results["stream_resolve_status"] = r2.status_code
-                        if r2.status_code == 200:
-                            results["stream_url_preview"] = r2.json().get("url", "")[:80] + "..."
+                        # Coba semua transcoding sampai ada yang work
+                        for tc in transcodings:
+                            stream_url_endpoint = tc["url"]
+                            protocol = tc.get("format", {}).get("protocol", "")
+                            results[f"transcoding_{protocol}"] = stream_url_endpoint[:60]
+                            r2 = await hc.get(
+                                stream_url_endpoint,
+                                params={"client_id": SC_CLIENT_ID},
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                    "Referer": "https://soundcloud.com/",
+                                    "Origin": "https://soundcloud.com",
+                                }
+                            )
+                            results[f"stream_status_{protocol}"] = r2.status_code
+                            if r2.status_code == 200:
+                                results["stream_url_preview"] = r2.json().get("url", "")[:80] + "..."
+                                results["WORKING_PROTOCOL"] = protocol
+                                break
             else:
                 results["error_body"] = r.text[:200]
     except Exception as e:
