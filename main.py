@@ -196,7 +196,7 @@ async def shutdown():
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://i-muzix.vercel.app",
+    "https://play-muzix.vercel.app/",
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if _frontend_url:
