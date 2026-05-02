@@ -196,10 +196,11 @@ async def shutdown():
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://play-muzix.vercel.app",
+    "https://i-muzix.vercel.app",
+    "https://play-muzix.vercel.app",  # URL frontend aktif
 ]
 _frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
-if _frontend_url:
+if _frontend_url and _frontend_url not in _origins:
     _origins.append(_frontend_url)
 
 app.add_middleware(
@@ -535,8 +536,13 @@ async def _get_track_meta(video_id: str) -> tuple[str, str]:
         details = info.get("videoDetails", {})
         title = details.get("title", "")
         artist = details.get("author", "")
+        if title:
+            logger.info(f"Track meta OK: '{title}' by '{artist}'")
+        else:
+            logger.warning(f"Track meta kosong untuk {video_id}, response: {list(info.keys())}")
         return title, artist
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Track meta gagal untuk {video_id}: {e}")
         return "", ""
 
 
@@ -781,13 +787,17 @@ async def get_stream(video_id: str, quality: str = "normal"):
         logger.info(f"Stream cache hit: {video_id}")
         return {"url": cached, "videoId": video_id, "method": "stream", "quality": quality, "source": "cache"}
 
-    # 2️⃣ SoundCloud — ambil metadata dulu, terus search SC
+    # 2️⃣ SoundCloud — coba ambil metadata, kalau gagal skip SC
     title, artist = await _get_track_meta(video_id)
     if title:
         sc_url = await resolve_via_soundcloud(title, artist)
         if sc_url:
             _stream_cache_set(video_id, quality, sc_url)
             return {"url": sc_url, "videoId": video_id, "method": "stream", "quality": quality, "source": "soundcloud"}
+        else:
+            logger.warning(f"SC tidak ketemu lagu: '{title}' by '{artist}'")
+    else:
+        logger.warning(f"Metadata kosong untuk {video_id} — skip SC, langsung yt-dlp")
 
     # 3️⃣ yt-dlp fallback
     stream_url = await resolve_via_ytdlp(video_id, quality)
